@@ -2,20 +2,6 @@ package com.example.demo.model;
 
 /**
  * Represents a single issue detected during the document audit.
- * <p>
- * <b>The confidence score is deliberately nullable, and no default is applied.</b>
- * <p>
- * An earlier version assigned 0.8 whenever the value was missing or non-positive.
- * That default sits <em>above</em> the filtering threshold applied downstream, so a
- * model that never emitted the field at all would see its issues pass the filter with
- * a score no model had produced. A failure to comply with the output format would thus
- * disguise itself as a success — and the effect grows as the model gets smaller, that
- * is precisely in the region this work is investigating.
- * <p>
- * Removing the default is not by itself sufficient: with a primitive type, «not
- * emitted» and «emitted as zero» remain indistinguishable, which is the very ambiguity
- * the default was masking. Hence the wrapper type, and hence
- * {@link #hasConfidence()} for call sites that need to tell the two apart.
  *
  * @param id              Unique identifier (e.g. REQ-001, TST-001)
  * @param severity        Severity level
@@ -24,8 +10,7 @@ package com.example.demo.model;
  * @param quote           Verbatim quote from the original document
  * @param category        Issue category (Requirements, Architecture, Testing)
  * @param recommendation  Suggested corrective action for the student
- * @param confidenceScore Agent confidence (0.0-1.0), or {@code null} when the model
- *                        did not emit the field. Never defaulted.
+ * @param confidenceScore Agent confidence level (0.0-1.0), as declared by the model.
  */
 public record AuditIssue(
         String id,
@@ -35,24 +20,30 @@ public record AuditIssue(
         String quote,
         String category,
         String recommendation,
-        Double confidenceScore
+        double confidenceScore
 ) {
-
-    /** Whether the model actually emitted a confidence score for this issue. */
-    public boolean hasConfidence() {
-        return confidenceScore != null;
-    }
-
     /**
-     * The confidence as a primitive, treating an absent value as zero.
+     * No default is applied to {@code confidenceScore}.
      * <p>
-     * For arithmetic and for the filtering threshold. Zero is the conservative reading:
-     * an issue whose confidence the model never stated does not get the benefit of the
-     * doubt, whereas the previous default granted it more confidence than most issues
-     * that were scored explicitly.
+     * The original version raised any value of 0.0 or below to 0.8. {@code double} is a
+     * primitive, so a field the model omits arrives as 0.0 rather than null, and without
+     * a default a finding would be discarded because of a missing field.
+     * <p>
+     * But the default makes "the model did not emit the field" indistinguishable from "the
+     * model declared 0.8". Emitting a numeric field correctly in structured JSON is the first
+     * capability to degrade asmodels get smaller, precisely the failure mode under study.
+     * Worse, the default pushes in the model's favour: 0.8 survives every anchoring penalty
+     * except the harshest, so a model that ignores the field is advantaged over one that fills
+     * it, and the confidence filter ends up applying one criterion to the reference and another
+     * to the candidate.
+     * <p>
+     * Leaving 0.0 is the correct behaviour: a finding whose confidence nobody produced has
+     * no claim on the report. The consequence is deliberate — a model that never emits the
+     * field has all its findings filtered out, which is a genuine failure of format and
+     * should be recorded as one.
      */
-    public double confidenceOrZero() {
-        return confidenceScore != null ? confidenceScore : 0.0;
+    public AuditIssue {
+        // Intentionally empty: see the note above.
     }
 
     /** Creates a copy with a new ID. */

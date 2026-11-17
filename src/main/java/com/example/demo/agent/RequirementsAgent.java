@@ -2,6 +2,7 @@ package com.example.demo.agent;
 
 import com.example.demo.config.ChatClientRegistry;
 import com.example.demo.config.LlmRole;
+
 import com.example.demo.model.AgentResponse;
 import com.example.demo.model.AuditIssue;
 import com.example.demo.model.IssuesResponse;
@@ -9,6 +10,7 @@ import com.example.demo.service.ResilientLlmCaller;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -21,12 +23,15 @@ import java.util.List;
  * - Use Cases without test coverage
  * - Inconsistencies between functional and non-functional requirements
  */
+
+//The only difference with the original is the added link to the agent Role
+
 @Service
 public class RequirementsAgent {
 
     private static final Logger log = LoggerFactory.getLogger(RequirementsAgent.class);
 
-        private static final String DEFAULT_SYSTEM_PROMPT = """
+        private static final String SYSTEM_PROMPT = """
                         You are an ISO/IEC 25010 auditor specialized in Software Engineering.
                         You are analyzing a project document (thesis/report) written by a university student.
                         Your report must be USEFUL TO THE STUDENT to improve their work.
@@ -94,24 +99,11 @@ public class RequirementsAgent {
                         """;
 
     private final ChatClient chatClient;
-
-    /**
-     * System prompt in force for this execution.
-     * <p>
-     * Falls back to the built-in one when the blueprint does not override it, so that
-     * a substitution-only run reproduces the original behaviour exactly. Overriding it
-     * is what the prompting intervention level consists of, and keeping the value in an
-     * instance field — rather than a constant — is what makes that level possible
-     * without recompiling.
-     */
-    private final String systemPrompt;
-    private final com.example.demo.config.RetryPolicy retryPolicy;
+    private final ChatClientRegistry registry;
 
     public RequirementsAgent(ChatClientRegistry registry) {
+        this.registry = registry;
         this.chatClient = registry.clientFor(LlmRole.REQUIREMENTS_AGENT);
-        String configured = registry.promptFor(LlmRole.REQUIREMENTS_AGENT);
-        this.systemPrompt = configured != null ? configured : DEFAULT_SYSTEM_PROMPT;
-        this.retryPolicy = registry.retryPolicy();
     }
 
     /**
@@ -125,7 +117,7 @@ public class RequirementsAgent {
 
         try {
                 IssuesResponse response = ResilientLlmCaller.callEntity(
-                    chatClient, systemPrompt,
+                    chatClient, SYSTEM_PROMPT,
                     """
                         Analyze the following Software Engineering document.
                         Identify all problems related to requirements, use cases, and business logic.
@@ -138,7 +130,7 @@ public class RequirementsAgent {
                         %s
                         ---
                         """.formatted(documentText),
-                    IssuesResponse.class, LlmRole.REQUIREMENTS_AGENT, retryPolicy);
+                    IssuesResponse.class, LlmRole.REQUIREMENTS_AGENT, registry.retryPolicy());
 
             List<AuditIssue> issues = (response != null && response.issues() != null)
                     ? response.issues()

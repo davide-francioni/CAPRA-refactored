@@ -1,29 +1,39 @@
 spring:
   application:
     name: swe-audit-agent
-  # Spring AI's autoconfiguration is disabled: clients are now built per role by
-  # ChatClientRegistry from the blueprint below. Leaving it active would be worse than
-  # redundant — it would look for provider credentials that do not exist in benchmark
-  # mode, and it would leave a second source of truth for model configuration, so that
-  # a stray setting could influence a run without appearing in the archived blueprint.
-  #
-  # Note that the chat models are not the only ones autoconfigured: embedding, image,
-  # audio and moderation are too, and each demands an API key at startup even though
-  # this system never invokes them. All of them have to be excluded.
-  autoconfigure:
-    exclude:
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiChatAutoConfiguration
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiModerationAutoConfiguration
-      - org.springframework.ai.model.anthropic.autoconfigure.AnthropicChatAutoConfiguration
   data:
     mongodb:
       host: localhost
       port: 27017
       database: features_repo
+  ai:
+    # These blocks feed Spring AI's autoconfigured models, which the blueprint mechanism no
+    # longer uses: every role's client is built by ChatClientFactory from the blueprint
+    # below. They are kept only because the autoconfiguration still runs.
+    #
+    # The keys carry a fallback on purpose. In a benchmark run the models are local engines
+    # needing no authentication, and without a fallback an unset variable would stop the
+    # application at startup for the sake of beans nobody calls.
+    openai:
+      api-key: ${OPENAI_API_KEY:not-set}
+      chat:
+        options:
+          model: gpt-5.1
+          max-completion-tokens: 16000
+          temperature: 0.0
+          seed: 42
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY:not-set}
+      chat:
+        options:
+          model: claude-haiku-4-5-20251001
+          max-tokens: 8192
+          temperature: 0.0
+    retry:
+      max-attempts: 2
+      backoff:
+        initial-interval: 2000
+        multiplier: 2
   servlet:
     multipart:
       max-file-size: 50MB
@@ -42,55 +52,44 @@ audit:
     output-dir: ./reports
     pdflatex-path: pdflatex
 
-# ---------------------------------------------------------------------------
-# Blueprint: which model answers for which role.
-# ---------------------------------------------------------------------------
-# The one below reproduces the original configuration and is what generates the
-# reference outputs. A benchmark run overrides it with an external file:
+# ── Blueprint: which model answers for which role ──────────────────────────────────────
+# This is the DEFAULT, reproducing CAPRA's original setup: GPT-5.1 for the six analysis
+# roles, Claude Haiku for the LaTeX report. A benchmark run overrides it with an external
+# file passed at startup:
 #
 #   java -jar capra.jar --spring.config.additional-location=file:/path/blueprint.yaml
 #
-# The unit of configuration is the ROLE, not the provider nor the Java class: that is
-# what keeps blueprints valid even if the code around them is reorganised.
+# Every one of the seven roles must be resolvable, or startup fails. That is deliberate:
+# the role list is duplicated in the benchmarking platform, and a mismatch should surface
+# as an immediate error rather than as odd results.
+#
+# Map keys use bracket notation so that the enum names reach the binder unaltered.
 blueprint:
   id: baseline-original
-  description: Original CAPRA configuration - reference output generation
+  description: Original CAPRA configuration
   intervention-level: L0_SOSTITUZIONE
-
   defaults:
-    provider: OPENAI
-    base-url: https://api.openai.com
-    api-key: ${OPENAI_API_KEY}
+    provider: openai
+    api-key: ${OPENAI_API_KEY:not-set}
     model: gpt-5.1
     timeout-seconds: 300
     options:
       temperature: 0.0
       seed: 42
       max-completion-tokens: 16000
-
   roles:
-    # Five of the six roles inherit the defaults entirely. Only the report generation
-    # differs, exactly as in the original setup.
-    LATEX_REPORT:
-      provider: ANTHROPIC
-      base-url: https://api.anthropic.com
-      api-key: ${ANTHROPIC_API_KEY}
+    "[LATEX_REPORT]":
+      provider: anthropic
+      api-key: ${ANTHROPIC_API_KEY:not-set}
       model: claude-haiku-4-5-20251001
       options:
         temperature: 0.0
         max-tokens: 8192
-
-  # Prompts are left unset: each agent falls back to the one compiled into it, so the
-  # baseline reproduces the original behaviour exactly rather than depending on a
-  # faithful transcription here. Overriding them is what the prompting intervention
-  # level consists of.
-
   retry:
-    # Transport-level retry stays off. It absorbs infrastructure problems and reports
-    # them as successes, which is precisely what has to remain distinguishable from a
-    # model being unable to do the job. Three application-level attempts remain, each
-    # logged with its cause.
-    spring-ai-enabled: false
+    # Outside a benchmark the original behaviour is kept, both retry layers included.
+    # A benchmark blueprint sets this to false: transport retry absorbs infrastructure
+    # failures and reports them as successes.
+    spring-ai-enabled: true
     application-max-attempts: 3
 
 logging:

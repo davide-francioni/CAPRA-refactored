@@ -1,11 +1,11 @@
 package com.example.demo.service;
 
 import com.example.demo.config.AuditProperties;
-import com.example.demo.config.ChatClientRegistry;
-import com.example.demo.config.LlmRole;
 import com.example.demo.model.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.example.demo.config.ChatClientRegistry;
+import com.example.demo.config.LlmRole;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
@@ -18,14 +18,9 @@ import java.util.stream.Collectors;
 
 /**
  * Generates the audit report in LaTeX format.
- * <p>
- * Uses the model assigned to {@link LlmRole#LATEX_REPORT} for the narrative sections.
- * <p>
- * This service previously attempted one provider and, on failure, fell back silently
- * to the other. That behaviour has been removed: under measurement it would substitute
- * the output of a model that was not the one under test and record the execution as
- * successful, producing a result that is not merely degraded but false. Failures now
- * propagate, so that they can be observed.
+ * The narrative sections are written by the model assigned to {@link LlmRole#LATEX_REPORT}
+ * in the blueprint — Haiku 4.5 in the original configuration. There is no fallback to a
+ * second provider: see {@link #callLlm}.
  * <p>
  * Report structure:
  * 1. Document Context
@@ -36,6 +31,10 @@ import java.util.stream.Collectors;
  * 6. Category Detail (grouped by UC)
  * 7. Priority Recommendations
  */
+
+// The difference with the original is that now the chatClient is only one and generic,
+// every failure is now recorded and the fallback to the other model is now removed.
+
 @Service
 public class LatexReportService {
 
@@ -44,8 +43,7 @@ public class LatexReportService {
     private final ChatClient chatClient;
     private final AuditProperties properties;
 
-    public LatexReportService(ChatClientRegistry registry,
-                              AuditProperties properties) {
+    public LatexReportService(ChatClientRegistry registry, AuditProperties properties) {
         this.chatClient = registry.clientFor(LlmRole.LATEX_REPORT);
         this.properties = properties;
     }
@@ -113,17 +111,14 @@ public class LatexReportService {
             """;
 
         try {
-                String context = callLlm(contextPrompt,
+            String context = callLlm(contextPrompt,
                     "Here is the document text:\n\n" + fullText);
             log.debug("Document context generated ({} characters)", context.length());
             return context;
         } catch (Exception e) {
-            // Deliberately not replaced with placeholder text. A placeholder would let a
-            // failed generation reach the report and be recorded as a working
-            // configuration — the same substitution the removed fallback performed, one
-            // level higher up.
-            log.error("Document context generation failed", e);
-            throw new IllegalStateException("Document context generation failed: " + e.getMessage(), e);
+            recordFailure(e);
+            log.warn("Unable to generate document context: {}", e.getMessage());
+            return "The document context is not available due to an error in automatic generation.";
         }
     }
 
@@ -186,10 +181,13 @@ public class LatexReportService {
             log.debug("Executive summary generated ({} characters)", summary.length());
             return summary;
         } catch (Exception e) {
-            // See the note in generateDocumentContext: a synthesised summary would hide
-            // the failure of the model actually under test.
-            log.error("Executive summary generation failed", e);
-            throw new IllegalStateException("Executive summary generation failed: " + e.getMessage(), e);
+            recordFailure(e);
+            log.warn("Unable to generate executive summary: {}", e.getMessage());
+            return ("The analysis of document '%s' found %d issues, " +
+                    "of which %d are high severity. A thorough review of the critical areas identified in the report is recommended.").formatted(
+                    report.documentName(),
+                    report.totalIssues(),
+                    report.severityDistribution().getOrDefault(Severity.HIGH, 0L));
         }
     }
 
@@ -241,26 +239,17 @@ public class LatexReportService {
         try {
             return callLlm(systemPrompt, userPrompt);
         } catch (Exception e) {
-            // See the note in generateDocumentContext.
-            log.error("Strengths section generation failed", e);
-            throw new IllegalStateException("Strengths section generation failed: " + e.getMessage(), e);
+            recordFailure(e);
+            log.warn("Unable to generate strengths section: {}", e.getMessage());
+            return "The strengths analysis is not available due to an error in automatic generation.";
         }
     }
 
     /**
-     * Invokes the model assigned to this role.
+     * Calls the model assigned to the LaTeX role.
      * <p>
-     * There is deliberately no fallback. An earlier version tried a second provider
-     * when the first failed, which under measurement would have replaced the output of
-     * the model being tested with that of a different one, while recording the run as
-     * successful. That is the most treacherous of the failure modes encountered in this
-     * system, because it does not surface as an anomaly: it produces a clean, plausible
-     * result indistinguishable from a genuine success.
-     * <p>
-     * Failures therefore propagate to the caller, which reports them as a blocking
-     * failure of the execution.
-     *
-     * @throws IllegalStateException if the model returns an empty response
+     * <b>No fallback.</b> The original version retried with a different provider when this
+     * one failed or answered empty. In a benchmark that is not acceptable.
      */
     private String callLlm(String systemPrompt, String userPrompt) {
         org.springframework.ai.chat.model.ChatResponse chatResponse = chatClient.prompt()
@@ -268,31 +257,38 @@ public class LatexReportService {
                 .user(userPrompt)
                 .call()
                 .chatResponse();
-
         captureTokens(chatResponse);
-
         String result = chatResponse != null && chatResponse.getResult() != null
                 ? chatResponse.getResult().getOutput().getText() : null;
-
         if (result == null || result.isBlank()) {
-            // An empty response is a failure of the model, not a degenerate success:
-            // returning an empty string here would let a blank section reach the report
-            // and be counted as a working configuration.
-            throw new IllegalStateException(
-                    "The model assigned to " + LlmRole.LATEX_REPORT + " returned an empty response");
+            throw new IllegalStateException("Empty response from the LaTeX role");
         }
         return result;
+    }
+
+    /**
+     * Makes a failure of the LaTeX role visible
+     * <p>
+     * Each narrative section catches its own failure and substitutes a placeholder, so
+     * that a report is produced anyway. That behaviour is kept, it is what the system
+     * does for its real users, but on its own it would let the document compile with
+     * placeholder text, and the run would pass the check that looks for a compiled
+     * report. Recording the failure here keeps the report while stopping it from
+     * looking like a complete success.
+     */
+    private void recordFailure(Exception e) {
+        RetryEventCollector.record(LlmRole.LATEX_REPORT, 1,
+                ResilientLlmCaller.classifyCause(e), ResilientLlmCaller.rootCauseMessage(e));
     }
 
     /**
      * Accumulates token usage from a ChatResponse into the per-request
      * {@link TokenUsageAccumulator} (if one is active for the current thread).
      * <p>
-     * Attribution is recorded against the OpenAI counter regardless of the provider
-     * actually in use. With one model configured per role, the original split by
-     * provider no longer carries meaning, and per-role accounting is outside the scope
-     * of the present work: the figure it would replace is not published for the
-     * baseline either, so no comparison would be possible.
+     * The provider is inferred from the model name: with the model chosen by the
+     * blueprint, this class no longer knows in advance which one it is talking to.
+     *
+     * @param chatResponse the response to extract usage from
      */
     private void captureTokens(org.springframework.ai.chat.model.ChatResponse chatResponse) {
         if (chatResponse == null) return;
@@ -306,7 +302,7 @@ public class LatexReportService {
             if (input == 0 && output == 0) return;
             TokenUsageAccumulator acc = TokenUsageAccumulator.current();
             if (acc == null) return;
-            acc.addOpenAiTokens(input, output);
+            acc.add(LlmRole.LATEX_REPORT, metadata.getModel(), input, output);
             log.debug("LatexReportService: +{} in / +{} out tokens (model={})",
                     input, output, metadata.getModel());
         } catch (Exception e) {
@@ -412,6 +408,12 @@ public class LatexReportService {
         if (report.traceabilityMatrix() != null && !report.traceabilityMatrix().isEmpty()) {
             sb.append("\\section{Traceability Matrix}\n");
             sb.append(buildTraceabilityMatrix(report.traceabilityMatrix()));
+        }
+
+        // ── 10. Glossary Issues ──
+        if (report.glossaryIssues() != null && !report.glossaryIssues().isEmpty()) {
+            sb.append("\\section{Terminological Consistency}\n");
+            sb.append(buildGlossaryIssuesSection(report.glossaryIssues()));
         }
 
         sb.append("\\end{document}\n");
@@ -701,7 +703,7 @@ public class LatexReportService {
         };
 
         // Confidence badge
-        int confPct = (int) Math.round(issue.confidenceOrZero() * 100);
+        int confPct = (int) Math.round(issue.confidenceScore() * 100);
         String confColor = confPct >= 80 ? "present" : confPct >= 60 ? "partial" : "absent";
         String confBadge = "\\textcolor{%s}{[%d\\%%]}".formatted(confColor, confPct);
 
@@ -774,7 +776,7 @@ public class LatexReportService {
     }
 
     // ═══════════════════════════════════════════════════
-    // New section builders (Traceability, Layout)
+    // New section builders (Traceability, Glossary, Layout)
     // ═══════════════════════════════════════════════════
 
     /**
@@ -865,7 +867,7 @@ public class LatexReportService {
         // Average confidence if available
         if (!report.issues().isEmpty()) {
             double avgConf = report.issues().stream()
-                    .mapToDouble(AuditIssue::confidenceOrZero).average().orElse(0.0);
+                    .mapToDouble(AuditIssue::confidenceScore).average().orElse(0.0);
             sb.append("\\\\[0.2em] Average confidence: \\textbf{%d\\%%}\n".formatted(
                     (int) Math.round(avgConf * 100)));
         }
@@ -916,6 +918,41 @@ public class LatexReportService {
                     designMark,
                     testMark,
                     gapText));
+        }
+
+        sb.append("\\bottomrule\n");
+        sb.append("\\end{longtable}\n\n");
+
+        return sb.toString();
+    }
+
+    /**
+     * Terminological consistency section — glossary errors / inconsistent terminology.
+     */
+    private String buildGlossaryIssuesSection(List<GlossaryIssue> issues) {
+        var sb = new StringBuilder();
+
+        long major = issues.stream().filter(g -> "MAJOR".equalsIgnoreCase(g.severity())).count();
+        long minor = issues.size() - major;
+        sb.append("Found \\textbf{%d} terminological inconsistencies (%d major, %d minor).\n\n"
+                .formatted(issues.size(), major, minor));
+
+        sb.append("\\begin{longtable}{>{\\RaggedRight\\arraybackslash\\hspace{0pt}}p{3cm} >{\\RaggedRight\\arraybackslash\\hspace{0pt}}p{4cm} c >{\\RaggedRight\\arraybackslash\\hspace{0pt}}p{5cm}}\n");
+        sb.append("\\toprule\n");
+        sb.append("\\textbf{Group} & \\textbf{Variants found} & \\textbf{Severity} & \\textbf{Suggestion} \\\\\n");
+        sb.append("\\midrule\n");
+        sb.append("\\endhead\n");
+
+        for (GlossaryIssue g : issues) {
+            String sevColor = "MAJOR".equalsIgnoreCase(g.severity()) ? "highcolor" : "medcolor";
+            String variants = g.variants() != null ? escapeLatex(g.variants()) : "";
+
+            sb.append("%s & {\\small %s} & \\textcolor{%s}{%s} & {\\small %s} \\\\\n".formatted(
+                    escapeLatex(g.termGroup()),
+                    variants,
+                    sevColor,
+                    escapeLatex(g.severity()),
+                    escapeLatex(g.suggestion() != null ? g.suggestion() : "")));
         }
 
         sb.append("\\bottomrule\n");

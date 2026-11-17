@@ -1,5 +1,6 @@
 package com.example.demo.controller;
 
+import com.example.demo.config.ProviderRouting;
 import com.example.demo.model.AuditReport;
 import com.example.demo.model.AuditResult;
 import com.example.demo.model.AuditRunResponse;
@@ -19,7 +20,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.List;
 import java.util.Map;
@@ -163,16 +163,11 @@ public class PdfAnalysisController {
     /**
      * Analyzes a PDF and returns everything the execution produced, in one response.
      * <p>
-     * This is the endpoint an automated evaluation uses. The two older ones each
-     * provide half of what is needed: {@code /analyze} the compiled document without the
-     * structured report, {@code /analyze/json} the report without compiling anything.
-     * Calling both would run the models twice on the same document, at double the cost
-     * and with two outcomes that need not agree.
-     * <p>
-     * Failures are reported as fields rather than as exceptions: a run that did not
-     * produce a document is a legitimate outcome to record, not an error of this
-     * service. Only an unexpected fault returns a 500.
-     *
+     * The two endpoints above both run the whole pipeline, and each discards part of what
+     * it produced: one returns the compiled document without the structured report, the
+     * other the report without the document. An automated evaluation needs both — and
+     * calling both endpoints would run the models twice on the same document,
+     * doubling cost and time. This endpoint processes the document once.
      * <p>Endpoint: POST /api/analyze/full
      */
     @PostMapping(value = "/analyze/full", consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
@@ -188,70 +183,57 @@ public class PdfAnalysisController {
 
         log.info("Received full analysis request for '{}' ({} bytes)", filename, file.getSize());
 
-        TokenUsageAccumulator.start();
+        TokenUsageAccumulator tokens = TokenUsageAccumulator.start();
         RetryEventCollector retries = RetryEventCollector.start();
+        ProviderRouting.start();
         try {
             AuditResult result = orchestrator.analyze(file);
 
             boolean texGenerated = result.texFile() != null && Files.exists(result.texFile());
             boolean pdfGenerated = result.pdfFile() != null && Files.exists(result.pdfFile());
+            String latexSource = texGenerated ? Files.readString(result.texFile()) : null;
+            String compileError = texGenerated && !pdfGenerated
+                    ? "LaTeX source generated but compilation failed"
+                    : null;
 
-            String latexSource = null;
-            if (texGenerated) {
-                try {
-                    latexSource = Files.readString(result.texFile(), StandardCharsets.UTF_8);
-                } catch (Exception e) {
-                    // The file exists but cannot be read: report it rather than let the
-                    // response claim a source that is not there.
-                    log.warn("Generated LaTeX source could not be read: {}", e.getMessage());
-                    texGenerated = false;
-                }
-            }
-
-            AuditRunResponse response = new AuditRunResponse(
-                    result.report(),
-                    texGenerated,
-                    pdfGenerated,
-                    latexSource,
-                    result.compileError(),
-                    retries.events());
-
-            log.info("Full analysis completed for '{}' — tex={}, pdf={}, retries={} (of which {} infrastructural)",
-                    filename, texGenerated, pdfGenerated,
-                    response.retryEvents().size(), response.infrastructuralRetries());
-
-            return ResponseEntity.ok(response);
+            return ResponseEntity.ok(new AuditRunResponse(
+                    result.report(), texGenerated, pdfGenerated,
+                    latexSource, compileError, retries.events(), tokens.snapshot(),
+                    ProviderRouting.servedBy()));
 
         } catch (Exception e) {
             log.error("Error during full analysis of '{}'", filename, e);
+            // Retry events, token usage and the serving endpoints are returned even on
+            // failure: the first says whether the pipeline broke because of the model or
+            // the infrastructure, the second says what the attempt cost anyway, and the
+            // third says who answered, which is what makes a failure attributable to a
+            // particular endpoint rather than to the model
             return ResponseEntity.internalServerError()
                     .body(Map.of(
                             "error", "Error during analysis",
                             "message", e.getMessage() != null ? e.getMessage() : "Unknown error",
-                            "retryEvents", retries.events()
-                    ));
+                            "retryEvents", retries.events(),
+                            "tokenUsage", tokens.snapshot(),
+                            "servedBy", ProviderRouting.servedBy()));
         } finally {
             TokenUsageAccumulator.clear();
             RetryEventCollector.clear();
+            ProviderRouting.clear();
         }
     }
 
     /**
-     * Returns the expected-feature knowledge base as it stands.
+     * Exports the expected-feature knowledge base as it stands.
      * <p>
-     * That collection determines <em>what the feature-check agent looks for</em>, so it
-     * is an input of any evaluation rather than infrastructure: it has to be frozen and
-     * archived alongside the results. Exposing it here spares the caller from connecting
-     * to this system's database with its own driver and credentials merely to read a
-     * list.
+     * That collection decides what the feature-check agent looks forì. Exposing it lets
+     * archive it with the results and refuse to run when it is empty,
+     * which would otherwise make one of the seven roles unmeasurable.
      *
      * <p>Endpoint: GET /api/knowledge-base
      */
     @GetMapping(value = "/knowledge-base", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<List<Feature>> knowledgeBase() {
-        List<Feature> features = featureRepository.findAll();
-        log.info("Knowledge base export requested: {} features", features.size());
-        return ResponseEntity.ok(features);
+        return ResponseEntity.ok(featureRepository.findAll());
     }
 
     /**

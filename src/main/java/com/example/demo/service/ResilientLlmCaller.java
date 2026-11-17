@@ -24,14 +24,12 @@ import org.springframework.ai.converter.BeanOutputConverter;
  *   <li>Unexpected fields (ignoreUnknown)</li>
  * </ul>
  * <p>
- * Strategy: uses {@link BeanOutputConverter} with a lenient {@link ObjectMapper}
- * and retries according to the {@link RetryPolicy} declared in the blueprint.
- * <p>
- * <b>Every failed attempt is recorded with its cause classified</b> into
- * {@link RetryEventCollector}. That classification is what makes it acceptable to have
- * disabled the transport-level retry: without it, a momentary network interruption
- * would be indistinguishable from the model being unable to produce a valid response,
- * and the run would be recorded as a failure of the model.
+ * <b>Strategy Changed for the benchmark.</b> The caller is now identified by its {@link LlmRole}
+ * rather than by a free-text name, and the number of attempts comes from the blueprint's
+ * {@link RetryPolicy} rather than from a constant. Every failed attempt is recorded with
+ * its cause classified, which is what makes it acceptable to have disabled the
+ * transport-level retry: an infrastructure problem stays distinguishable from the model
+ * being unable to do the job.
  */
 public final class ResilientLlmCaller {
 
@@ -51,30 +49,23 @@ public final class ResilientLlmCaller {
     }
 
     /**
-     * Calls the LLM via {@code .entity(converter)} with retry and lenient JSON parsing.
-     * <p>
-     * The {@link BeanOutputConverter} automatically adds format instructions
-     * to the prompt and parses the response with the configured lenient ObjectMapper.
+     * Calls the LLM via a {@link BeanOutputConverter} with retry and lenient JSON parsing.
      *
-     * @param chatClient   the LLM client to use
+     * @param chatClient   the client for this role
      * @param systemPrompt the system prompt
      * @param userPrompt   the user prompt (format instructions are added automatically)
      * @param type         the target class for parsing
-     * @param role         the role making the call: typed, so that a failure can be
-     *                     attributed to a component rather than to the system at large
-     * @param policy       how many attempts to make; comes from the blueprint and is
-     *                     therefore archived with the run instead of being a constant
+     * @param role         which role is calling; recorded with every failed attempt
+     * @param policy       how many attempts to make, from the blueprint
      * @param <T>          target type
      * @return the parsed response
      * @throws RuntimeException if all attempts fail
      */
     public static <T> T callEntity(ChatClient chatClient, String systemPrompt, String userPrompt,
-                                    Class<T> type, LlmRole role, RetryPolicy policy) {
+                                   Class<T> type, LlmRole role, RetryPolicy policy) {
         var converter = new BeanOutputConverter<>(type, LENIENT_MAPPER);
-        // Append format instructions the same way Spring AI does internally
         String fullUserPrompt = userPrompt + "\n\n" + converter.getFormat();
-
-        int maxAttempts = policy != null ? policy.effectiveAttempts() : 3;
+        int maxAttempts = policy.effectiveAttempts();
 
         Exception lastError = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -85,10 +76,8 @@ public final class ResilientLlmCaller {
                         .call()
                         .chatResponse();
 
-                // ── Capture token usage ──────────────────────────────────────
                 captureTokenUsage(chatResponse, role);
 
-                // ── Parse response content ───────────────────────────────────
                 String content = (chatResponse != null && chatResponse.getResult() != null)
                         ? chatResponse.getResult().getOutput().getText()
                         : null;
@@ -96,12 +85,9 @@ public final class ResilientLlmCaller {
                     throw new RuntimeException("Empty or null content in LLM response");
                 }
                 return converter.convert(content);
+
             } catch (Exception e) {
                 lastError = e;
-
-                // Recorded on every failure, including the last: the purpose is not to
-                // count retries but to know why the attempt failed, and the final
-                // attempt is the one that decides the outcome of the run.
                 RetryCause cause = classifyCause(e);
                 RetryEventCollector.record(role, attempt, cause, rootCauseMessage(e));
 
@@ -115,61 +101,39 @@ public final class ResilientLlmCaller {
                         Thread.currentThread().interrupt();
                         break;
                     }
-                } else {
-                    log.error("{}: attempt {}/{} failed [{}] ({}), giving up",
-                            role, attempt, maxAttempts, cause, rootCauseMessage(e));
                 }
             }
         }
         throw new RuntimeException("Error in " + role + " after " + maxAttempts
-                + " attempts: " + (lastError != null ? lastError.getMessage() : "unknown"), lastError);
+                + " attempts: " + lastError.getMessage(), lastError);
     }
 
     /**
-     * Classifies a failure as infrastructural or attributable to the model.
-     * <p>
-     * This is the whole point of recording these events. The first three causes say
-     * something went wrong between here and the endpoint; the fourth says the model
-     * answered but could not produce the structure it was asked for — which is exactly
-     * the kind of failure this work sets out to observe.
-     * <p>
-     * The cause chain is walked by type, because the exception surfacing from the client
-     * layer wraps the underlying error rather than exposing it. The message is consulted
-     * only as a fallback.
+     * Classifies why an invocation failed.
      */
-    private static RetryCause classifyCause(Exception e) {
-        Throwable cause = e;
-        while (cause != null) {
-            if (cause instanceof java.net.SocketTimeoutException
-                    || cause instanceof java.util.concurrent.TimeoutException) {
+    public static RetryCause classifyCause(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            String name = t.getClass().getName();
+            String simple = t.getClass().getSimpleName().toLowerCase();
+
+            if (simple.contains("timeout")) {
                 return RetryCause.TIMEOUT;
             }
-            if (cause instanceof java.net.ConnectException
-                    || cause instanceof java.net.UnknownHostException) {
+            if (name.equals("java.net.ConnectException")
+                    || name.equals("java.net.UnknownHostException")
+                    || name.equals("java.net.NoRouteToHostException")
+                    || simple.contains("connection")) {
                 return RetryCause.CONNECTION_ERROR;
             }
-            if (cause instanceof org.springframework.web.client.RestClientResponseException) {
+            if (simple.contains("httpservererror") || simple.contains("httpclienterror")
+                    || simple.contains("responseexception") || simple.contains("transientaiexception")) {
                 return RetryCause.HTTP_ERROR;
             }
-            if (cause instanceof com.fasterxml.jackson.core.JacksonException) {
-                return RetryCause.PARSE_ERROR;
+            if (t == t.getCause()) {
+                break;
             }
-            cause = cause.getCause();
         }
-
-        // Nothing matched by type. An empty response and a conversion failure are both
-        // the model's doing, so they count as PARSE_ERROR rather than as infrastructure.
-        String lower = rootCauseMessage(e) != null ? rootCauseMessage(e).toLowerCase() : "";
-        if (lower.contains("timeout") || lower.contains("timed out")) {
-            return RetryCause.TIMEOUT;
-        }
-        if (lower.contains("connection") || lower.contains("connect")) {
-            return RetryCause.CONNECTION_ERROR;
-        }
-        if (lower.contains("empty or null content") || lower.contains("json") || lower.contains("parse")) {
-            return RetryCause.PARSE_ERROR;
-        }
-        return RetryCause.HTTP_ERROR;
+        return RetryCause.PARSE_ERROR;
     }
 
     private static void captureTokenUsage(ChatResponse chatResponse, LlmRole role) {
@@ -187,27 +151,23 @@ public final class ResilientLlmCaller {
             TokenUsageAccumulator acc = TokenUsageAccumulator.current();
             if (acc == null) return;
 
-            // Attribution by provider is left as it was. With one model configured per
-            // role the split carries little meaning, but reworking it belongs to the
-            // per-role accounting that is out of scope here.
-            String model = metadata.getModel() != null ? metadata.getModel().toLowerCase() : "";
-            if (model.contains("claude")) {
-                acc.addAnthropicTokens(input, output);
-                log.debug("{}: +{} in / +{} out Anthropic tokens (model={})",
-                        role, input, output, metadata.getModel());
-            } else {
-                acc.addOpenAiTokens(input, output);
-                log.debug("{}: +{} in / +{} out OpenAI tokens (model={})",
-                        role, input, output, metadata.getModel());
-            }
+            // removed the detection of the provider, is now saved as a role
+
+            acc.add(role, metadata.getModel(), input, output);
+            log.debug("{}: +{} in / +{} out tokens (model={})", role, input, output, metadata.getModel());
         } catch (Exception e) {
             log.debug("{}: failed to capture token usage — {}", role, e.getMessage());
         }
     }
 
-    private static String rootCauseMessage(Exception e) {
+    /**
+     * Public because the agents record their own failures: they catch the exception
+     * themselves, so that one failed role does not cost the whole report, and need the
+     * same diagnostic text this class writes for the attempts it handles.
+     */
+    public static String rootCauseMessage(Throwable e) {
         Throwable cause = e;
-        while (cause.getCause() != null) {
+        while (cause.getCause() != null && cause.getCause() != cause) {
             cause = cause.getCause();
         }
         String msg = cause.getMessage();

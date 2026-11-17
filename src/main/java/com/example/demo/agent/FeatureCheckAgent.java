@@ -2,6 +2,9 @@ package com.example.demo.agent;
 
 import com.example.demo.config.ChatClientRegistry;
 import com.example.demo.config.LlmRole;
+import com.example.demo.config.RetryCause;
+import com.example.demo.service.RetryEventCollector;
+
 import com.example.demo.model.Feature;
 import com.example.demo.model.FeatureCoverage;
 import com.example.demo.model.FeatureCoverageResponse;
@@ -10,6 +13,7 @@ import com.example.demo.repository.FeatureRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -20,12 +24,16 @@ import java.util.stream.Collectors;
  * Loads features from the summary_features collection and uses the LLM to check
  * which checklist items are satisfied in the document text.
  */
+
+//The only difference with the original is the added link to the agent Role and the
+//registration of the retry cause
+
 @Service
 public class FeatureCheckAgent {
 
     private static final Logger log = LoggerFactory.getLogger(FeatureCheckAgent.class);
 
-    private static final String DEFAULT_SYSTEM_PROMPT = """
+    private static final String SYSTEM_PROMPT = """
             You are a Software Engineering expert. You are provided with the text of a SWE project document (thesis/report) and a list of EXPECTED FEATURES, each with a checklist.
             
             TASK:
@@ -49,19 +57,13 @@ public class FeatureCheckAgent {
             """;
 
     private final ChatClient chatClient;
+    private final ChatClientRegistry registry;
     private final FeatureRepository featureRepository;
 
-    /** Blueprint override when present, built-in prompt otherwise. */
-    private final String systemPrompt;
-    private final com.example.demo.config.RetryPolicy retryPolicy;
-
-    public FeatureCheckAgent(ChatClientRegistry registry,
-                             FeatureRepository featureRepository) {
+    public FeatureCheckAgent(ChatClientRegistry registry, FeatureRepository featureRepository) {
+        this.registry = registry;
         this.chatClient = registry.clientFor(LlmRole.FEATURE_CHECK_AGENT);
         this.featureRepository = featureRepository;
-        String configured = registry.promptFor(LlmRole.FEATURE_CHECK_AGENT);
-        this.systemPrompt = configured != null ? configured : DEFAULT_SYSTEM_PROMPT;
-        this.retryPolicy = registry.retryPolicy();
     }
 
     /**
@@ -95,7 +97,7 @@ public class FeatureCheckAgent {
 
         try {
             FeatureCoverageResponse response = ResilientLlmCaller.callEntity(
-                    chatClient, systemPrompt,
+                    chatClient, SYSTEM_PROMPT,
                     """
                             Analyze the following document and verify the presence of each feature.
                             Write all output in ENGLISH. Do NOT translate document-specific feature names,
@@ -113,7 +115,7 @@ public class FeatureCheckAgent {
                             status, coverageScore, evidence, matchedItems and totalItems.
                             For the "category" field use one of: Requirements, Architecture, Testing, Design, Documentation.
                             """.formatted(documentText, featuresDescription),
-                    FeatureCoverageResponse.class, LlmRole.FEATURE_CHECK_AGENT, retryPolicy);
+                    FeatureCoverageResponse.class, LlmRole.FEATURE_CHECK_AGENT, registry.retryPolicy());
 
             if (response != null && response.features() != null) {
                 long present = response.features().stream()
@@ -128,6 +130,11 @@ public class FeatureCheckAgent {
                 return response.features();
             }
 
+            // An empty coverage list is indistinguishable, downstream, from a document in
+            // which the model found nothing to report. Recording the null response keeps a
+            // failure of this role from passing as a legitimate result.
+            RetryEventCollector.record(LlmRole.FEATURE_CHECK_AGENT, 1,
+                    RetryCause.PARSE_ERROR, "Null or empty feature coverage response");
             log.warn("FeatureCheckAgent: null response from LLM");
             return List.of();
 

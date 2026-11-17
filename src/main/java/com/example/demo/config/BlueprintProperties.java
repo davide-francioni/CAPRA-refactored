@@ -16,23 +16,20 @@ import java.util.Map;
  *
  * @param id                identifier of the execution, archived with the results
  * @param description       free text
- * @param interventionLevel pure metadata: read and logged, nothing else. It exists
- *                          because it is archived with the run, and that is what makes
- *                          a result attributable — otherwise a results file would say
- *                          «model X failed» without saying which prompts it was using
+ * @param interventionLevel pure metadata: read and logged
  * @param defaults          applied to every role not overridden
  * @param roles             per-role overrides, merged field by field over the defaults
- * @param prompts           system prompts per role; absent means «use the built-in one»
- * @param retry             retry policy, archived with the run rather than hidden in code
+ * @param retry             retry policy, archived with the run
  */
-@ConfigurationProperties(prefix = "blueprint")
+// ignoreUnknownFields = false: an unrecognised key under `blueprint:` fails the startup
+
+@ConfigurationProperties(prefix = "blueprint", ignoreUnknownFields = false)
 public record BlueprintProperties(
         String id,
         String description,
         String interventionLevel,
         RoleConfig defaults,
         Map<LlmRole, RoleConfig> roles,
-        Map<LlmRole, String> prompts,
         RetryPolicy retry
 ) {
 
@@ -47,18 +44,6 @@ public record BlueprintProperties(
     public RoleConfig resolve(LlmRole role) {
         RoleConfig override = roles == null ? null : roles.get(role);
         return override == null ? defaults : override.mergedOver(defaults);
-    }
-
-    /**
-     * The externalised system prompt for a role, or {@code null} to use the one
-     * compiled into the agent.
-     * <p>
-     * Needed from intervention level L1 onwards, where prompts are rewritten for
-     * smaller models. Returning {@code null} at L0 keeps the original behaviour
-     * exactly, which is what the baseline requires.
-     */
-    public String promptFor(LlmRole role) {
-        return prompts == null ? null : prompts.get(role);
     }
 
     /** The retry policy, falling back to the benchmark default when unspecified. */

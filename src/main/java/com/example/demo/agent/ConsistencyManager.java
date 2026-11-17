@@ -1,16 +1,20 @@
 package com.example.demo.agent;
 
+import com.example.demo.config.ChatClientRegistry;
+import com.example.demo.config.LlmRole;
+import com.example.demo.config.RetryCause;
+import com.example.demo.service.RetryEventCollector;
+
 import com.example.demo.model.AuditIssue;
 import com.example.demo.model.VerificationResponse;
 import com.example.demo.model.VerifiedIssue;
-import com.example.demo.config.ChatClientRegistry;
-import com.example.demo.config.LlmRole;
 import com.example.demo.service.ResilientLlmCaller;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -27,12 +31,16 @@ import java.util.stream.Collectors;
  * - Cross-agent deduplication
  * - Sequential ID renumbering
  */
+
+//The only difference with the original is the added link to the agent Role and the
+//registration of the retry cause
+
 @Service
 public class ConsistencyManager {
 
     private static final Logger log = LoggerFactory.getLogger(ConsistencyManager.class);
 
-                private static final String DEFAULT_SYSTEM_PROMPT = """
+                private static final String SYSTEM_PROMPT = """
                                                 You are a meta-auditor tasked with VERIFYING and CONSOLIDATING reports produced by other auditors.
                                                 Your goal is to ELIMINATE false positives, confirm only real issues, and MERGE redundant ones.
                             
@@ -73,19 +81,13 @@ public class ConsistencyManager {
                                                 """;
 
     private final ChatClient chatClient;
+    private final ChatClientRegistry registry;
     private final ObjectMapper objectMapper;
 
-    /** Blueprint override when present, built-in prompt otherwise. */
-    private final String systemPrompt;
-    private final com.example.demo.config.RetryPolicy retryPolicy;
-
-    public ConsistencyManager(ChatClientRegistry registry,
-                              ObjectMapper objectMapper) {
+    public ConsistencyManager(ChatClientRegistry registry, ObjectMapper objectMapper) {
+        this.registry = registry;
         this.chatClient = registry.clientFor(LlmRole.CONSISTENCY_MANAGER);
         this.objectMapper = objectMapper;
-        String configured = registry.promptFor(LlmRole.CONSISTENCY_MANAGER);
-        this.systemPrompt = configured != null ? configured : DEFAULT_SYSTEM_PROMPT;
-        this.retryPolicy = registry.retryPolicy();
     }
 
     /**
@@ -108,7 +110,7 @@ public class ConsistencyManager {
                     .writeValueAsString(candidateIssues);
 
             VerificationResponse response = ResilientLlmCaller.callEntity(
-                    chatClient, systemPrompt,
+                    chatClient, SYSTEM_PROMPT,
                     """
                             ORIGINAL DOCUMENT TEXT:
                             ===BEGIN DOCUMENT===
@@ -124,9 +126,15 @@ public class ConsistencyManager {
                             Write all output in ENGLISH. Do NOT translate document-specific identifiers,
                             use case names, or any term exactly as it appears in the document.
                             """.formatted(documentText, issuesJson),
-                    VerificationResponse.class, LlmRole.CONSISTENCY_MANAGER, retryPolicy);
+                    VerificationResponse.class, LlmRole.CONSISTENCY_MANAGER, registry.retryPolicy());
 
             if (response == null || response.verifiedIssues() == null) {
+                // The pipeline carries on with the unverified candidates, which is the right
+                // behaviour for real users. But on its own it would look exactly like a
+                // verification that found nothing to reject: recording it keeps the difference
+                // visible to whoever is measuring
+                RetryEventCollector.record(LlmRole.CONSISTENCY_MANAGER, 1,
+                        RetryCause.PARSE_ERROR, "Null or empty verification response");
                 log.warn("ConsistencyManager: null response, returning all issues unverified");
                 return renumber(candidateIssues);
             }

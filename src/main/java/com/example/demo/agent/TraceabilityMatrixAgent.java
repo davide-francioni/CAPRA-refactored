@@ -1,13 +1,15 @@
 package com.example.demo.agent;
 
-import com.example.demo.model.TraceabilityEntry;
-import com.example.demo.model.TraceabilityMatrixResponse;
 import com.example.demo.config.ChatClientRegistry;
 import com.example.demo.config.LlmRole;
+
+import com.example.demo.model.TraceabilityEntry;
+import com.example.demo.model.TraceabilityMatrixResponse;
 import com.example.demo.service.ResilientLlmCaller;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -19,12 +21,15 @@ import java.util.List;
  * This is one of the most important checks in SWE: students
  * almost never produce a complete matrix.
  */
+
+//The only difference with the original is the added link to the agent Role
+
 @Service
 public class TraceabilityMatrixAgent {
 
     private static final Logger log = LoggerFactory.getLogger(TraceabilityMatrixAgent.class);
 
-        private static final String DEFAULT_SYSTEM_PROMPT = """
+        private static final String SYSTEM_PROMPT = """
                         You are a Software Engineering expert specialized in requirements traceability.
             
                         TASK:
@@ -53,16 +58,11 @@ public class TraceabilityMatrixAgent {
                         """;
 
     private final ChatClient chatClient;
-
-    /** Blueprint override when present, built-in prompt otherwise. */
-    private final String systemPrompt;
-    private final com.example.demo.config.RetryPolicy retryPolicy;
+    private final ChatClientRegistry registry;
 
     public TraceabilityMatrixAgent(ChatClientRegistry registry) {
+        this.registry = registry;
         this.chatClient = registry.clientFor(LlmRole.TRACEABILITY_MATRIX_AGENT);
-        String configured = registry.promptFor(LlmRole.TRACEABILITY_MATRIX_AGENT);
-        this.systemPrompt = configured != null ? configured : DEFAULT_SYSTEM_PROMPT;
-        this.retryPolicy = registry.retryPolicy();
     }
 
     /**
@@ -76,7 +76,7 @@ public class TraceabilityMatrixAgent {
 
         try {
             TraceabilityMatrixResponse response = ResilientLlmCaller.callEntity(
-                    chatClient, systemPrompt,
+                    chatClient, SYSTEM_PROMPT,
                     """
                             Analyze the following Software Engineering document and build
                             a complete traceability matrix UC/Requirements -> Design -> Test.
@@ -88,7 +88,7 @@ public class TraceabilityMatrixAgent {
                             %s
                             ===END===
                             """.formatted(documentText),
-                    TraceabilityMatrixResponse.class, LlmRole.TRACEABILITY_MATRIX_AGENT, retryPolicy);
+                    TraceabilityMatrixResponse.class, LlmRole.TRACEABILITY_MATRIX_AGENT, registry.retryPolicy());
 
             if (response != null && response.entries() != null) {
                 long withDesign = response.entries().stream().filter(TraceabilityEntry::hasDesign).count();

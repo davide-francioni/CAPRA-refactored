@@ -6,7 +6,7 @@ import com.example.demo.config.RetryCause;
 import java.time.Instant;
 
 /**
- * One failed model invocation, with its cause classified.
+ * One failed model invocation, with its cause classified
  *
  * @param role          which role was calling
  * @param attemptNumber 1 for the first attempt
@@ -25,7 +25,7 @@ public record RetryEvent(
         return new RetryEvent(role, attemptNumber, cause, detail, Instant.now());
     }
 
-    /** Whether this failure points at the infrastructure rather than at the model. */
+    /** Whether this failure points at the infrastructure rather than at the model */
     public boolean isInfrastructural() {
         return cause != null && cause.isInfrastructural();
     }

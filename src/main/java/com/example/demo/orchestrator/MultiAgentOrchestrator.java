@@ -22,7 +22,7 @@ import java.util.stream.Stream;
  * Multi-agent pipeline orchestrator.
  * Pipeline:
  * 1. Text extraction (Flask)
- * 2. Parallel analysis: Requirements + TestAuditor + Features + Traceability
+ * 2. Parallel analysis: Requirements + TestAuditor + Features + Traceability + Glossary
  * 3. Evidence Anchoring (fuzzy match, NO LLM)
  * 4. Confidence filtering (discard confidence < threshold)
  * 5. LLM cross-verification (ConsistencyManager)
@@ -49,6 +49,7 @@ public class MultiAgentOrchestrator {
     private final TestAuditorAgent testAuditorAgent;
     private final FeatureCheckAgent featureCheckAgent;
     private final TraceabilityMatrixAgent traceabilityAgent;
+    private final GlossaryConsistencyAgent glossaryAgent;
     private final EvidenceAnchoringService evidenceAnchoring;
     private final ConsistencyManager consistencyManager;
     private final LatexReportService latexReportService;
@@ -60,6 +61,7 @@ public class MultiAgentOrchestrator {
                                   TestAuditorAgent testAuditorAgent,
                                   FeatureCheckAgent featureCheckAgent,
                                   TraceabilityMatrixAgent traceabilityAgent,
+                                  GlossaryConsistencyAgent glossaryAgent,
                                   EvidenceAnchoringService evidenceAnchoring,
                                   ConsistencyManager consistencyManager,
                                   LatexReportService latexReportService,
@@ -70,6 +72,7 @@ public class MultiAgentOrchestrator {
         this.testAuditorAgent = testAuditorAgent;
         this.featureCheckAgent = featureCheckAgent;
         this.traceabilityAgent = traceabilityAgent;
+        this.glossaryAgent = glossaryAgent;
         this.evidenceAnchoring = evidenceAnchoring;
         this.consistencyManager = consistencyManager;
         this.latexReportService = latexReportService;
@@ -89,7 +92,7 @@ public class MultiAgentOrchestrator {
         log.info("[1/7] Extraction completed: {} characters", fullText.length());
 
         // ── Step 2: Parallel analysis with ALL agents ──
-        log.info("[2/7] Starting parallel analysis (4 agents)...");
+        log.info("[2/7] Starting parallel analysis (5 agents)...");
 
         CompletableFuture<AgentResponse> reqFuture =
                 CompletableFuture.supplyAsync(() -> requirementsAgent.analyze(fullText), agentExecutor);
@@ -99,16 +102,19 @@ public class MultiAgentOrchestrator {
                 CompletableFuture.supplyAsync(() -> featureCheckAgent.checkFeatures(fullText), agentExecutor);
         CompletableFuture<List<TraceabilityEntry>> traceFuture =
                 CompletableFuture.supplyAsync(() -> traceabilityAgent.buildMatrix(fullText), agentExecutor);
+        CompletableFuture<List<GlossaryIssue>> glossaryFuture =
+                CompletableFuture.supplyAsync(() -> glossaryAgent.analyze(fullText), agentExecutor);
 
         AgentResponse reqResponse = reqFuture.join();
         AgentResponse testResponse = testFuture.join();
         List<FeatureCoverage> featureCoverage = featureFuture.join();
         List<TraceabilityEntry> traceability = traceFuture.join();
+        List<GlossaryIssue> glossaryIssues = glossaryFuture.join();
 
         log.info("[2/7] Analysis completed — REQ: {} issues, TST: {} issues, Features: {}, " +
-                        "Traceability: {} entries",
+                        "Traceability: {} entries, Glossary: {} issues",
                 reqResponse.issues().size(), testResponse.issues().size(),
-                featureCoverage.size(), traceability.size());
+                featureCoverage.size(), traceability.size(), glossaryIssues.size());
 
         // ── Step 3: Evidence Anchoring (fuzzy match, NO LLM) ──
         log.info("[3/7] Evidence Anchoring (quote verification via fuzzy match)...");
@@ -123,26 +129,12 @@ public class MultiAgentOrchestrator {
 
         // ── Step 4: Confidence filtering ──
         log.info("[4/7] Filtering by confidence (threshold {})...", CONFIDENCE_THRESHOLD);
-        // An issue whose confidence the model never stated is treated as zero and
-        // therefore discarded here. Previously such issues were assigned a default
-        // above this very threshold, so they passed the filter with a score no model
-        // had produced: a failure to comply with the output format disguised itself as
-        // a success.
         List<AuditIssue> confidentIssues = anchoredIssues.stream()
-                .filter(i -> i.confidenceOrZero() >= CONFIDENCE_THRESHOLD)
+                .filter(i -> i.confidenceScore() >= CONFIDENCE_THRESHOLD)
                 .toList();
         long filtered = anchoredIssues.size() - confidentIssues.size();
-        long unscored = anchoredIssues.stream().filter(i -> !i.hasConfidence()).count();
-        log.info("[4/7] {} issues with sufficient confidence ({} discarded below threshold, "
-                        + "of which {} carried no score at all)",
-                confidentIssues.size(), filtered, unscored);
-        if (unscored > 0) {
-            // Worth its own line: this is a format-compliance failure of the model, not
-            // a judgement about the issues, and it is one of the behaviours the
-            // benchmark is meant to observe.
-            log.warn("[4/7] the model omitted the confidence field on {} of {} issues",
-                    unscored, anchoredIssues.size());
-        }
+        log.info("[4/7] {} issues with sufficient confidence ({} discarded below threshold)",
+                confidentIssues.size(), filtered);
 
         // ── Step 5: LLM verification (ConsistencyManager) ──
         log.info("[5/7] LLM cross-verification on {} issues...", confidentIssues.size());
@@ -153,30 +145,25 @@ public class MultiAgentOrchestrator {
         // ── Step 6: Report generation ──
         log.info("[6/7] Generating LaTeX report...");
         AuditReport report = AuditReport.from(filename, verifiedIssues,
-                featureCoverage, traceability);
+                featureCoverage, traceability, glossaryIssues);
         Path texFile = latexReportService.generateReport(report, fullText);
         log.info("[6/7] LaTeX report generated: {}", texFile);
 
         // ── Step 7: PDF compilation ──
         Path pdfFile = null;
-        String compileError = null;
         try {
             log.info("[7/7] Compiling PDF with pdflatex...");
             pdfFile = latexCompilerService.compile(texFile);
             log.info("[7/7] PDF compiled: {}", pdfFile);
         } catch (Exception e) {
-            // The message is carried in the result, not merely logged: for an automated
-            // evaluation a failed compilation is a blocking outcome, and the reason has
-            // to travel with it.
-            compileError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-            log.warn("[7/7] PDF compilation failed (.tex file is still available): {}", compileError);
+            log.warn("[7/7] PDF compilation failed (.tex file is still available): {}", e.getMessage());
         }
 
         log.info("═══════════════════════════════════════════════");
-        log.info("Pipeline completed: {} issues, {} features, {} traceability",
-                report.totalIssues(), featureCoverage.size(), traceability.size());
+        log.info("Pipeline completed: {} issues, {} features, {} traceability, {} glossary",
+                report.totalIssues(), featureCoverage.size(), traceability.size(), glossaryIssues.size());
         log.info("═══════════════════════════════════════════════");
 
-        return new AuditResult(report, texFile, pdfFile, compileError);
+        return new AuditResult(report, texFile, pdfFile);
     }
 }

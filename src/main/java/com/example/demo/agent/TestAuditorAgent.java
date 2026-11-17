@@ -2,6 +2,7 @@ package com.example.demo.agent;
 
 import com.example.demo.config.ChatClientRegistry;
 import com.example.demo.config.LlmRole;
+
 import com.example.demo.model.AgentResponse;
 import com.example.demo.model.AuditIssue;
 import com.example.demo.model.IssuesResponse;
@@ -9,6 +10,7 @@ import com.example.demo.service.ResilientLlmCaller;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -21,12 +23,15 @@ import java.util.List;
  * - Inadequate or missing tests for alternative flows and errors
  * - Requirements-to-test traceability issues
  */
+
+//The only difference with the original is the added link to the agent Role
+
 @Service
 public class TestAuditorAgent {
 
     private static final Logger log = LoggerFactory.getLogger(TestAuditorAgent.class);
 
-        private static final String DEFAULT_SYSTEM_PROMPT = """
+        private static final String SYSTEM_PROMPT = """
                         You are an ISO/IEC auditor specialized in Software Testing and Quality Assurance.
                         You are analyzing a project document (thesis/report) written by a university student.
                         Your report must be USEFUL TO THE STUDENT to improve their work.
@@ -90,16 +95,11 @@ public class TestAuditorAgent {
                         """;
 
     private final ChatClient chatClient;
-
-    /** Blueprint override when present, built-in prompt otherwise. */
-    private final String systemPrompt;
-    private final com.example.demo.config.RetryPolicy retryPolicy;
+    private final ChatClientRegistry registry;
 
     public TestAuditorAgent(ChatClientRegistry registry) {
+        this.registry = registry;
         this.chatClient = registry.clientFor(LlmRole.TEST_AUDITOR_AGENT);
-        String configured = registry.promptFor(LlmRole.TEST_AUDITOR_AGENT);
-        this.systemPrompt = configured != null ? configured : DEFAULT_SYSTEM_PROMPT;
-        this.retryPolicy = registry.retryPolicy();
     }
 
     /**
@@ -113,7 +113,7 @@ public class TestAuditorAgent {
 
         try {
             IssuesResponse response = ResilientLlmCaller.callEntity(
-                    chatClient, systemPrompt,
+                    chatClient, SYSTEM_PROMPT,
                     """
                             Analyze the following Software Engineering document.
                             Focus on test coverage, consistency between design and implementation,
@@ -127,7 +127,7 @@ public class TestAuditorAgent {
                             %s
                             ---
                             """.formatted(documentText),
-                    IssuesResponse.class, LlmRole.TEST_AUDITOR_AGENT, retryPolicy);
+                    IssuesResponse.class, LlmRole.TEST_AUDITOR_AGENT, registry.retryPolicy());
 
             List<AuditIssue> issues = (response != null && response.issues() != null)
                     ? response.issues()

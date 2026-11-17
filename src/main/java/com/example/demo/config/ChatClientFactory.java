@@ -7,8 +7,13 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
 
+import java.time.Duration;
 import java.util.Map;
 
 /**
@@ -17,23 +22,24 @@ import java.util.Map;
  * This is what replaces the autoconfigured beans: instead of one model per provider,
  * decided at startup from a global configuration block, a model is constructed for
  * each configuration the blueprint declares.
- * <p>
- * The three providers collapse into two code paths. A local engine exposing the
- * OpenAI protocol is served by the same client as the real OpenAI API, differing only
- * in the base URL — which is why standardising on OpenAI-compatible engines costs no
- * new integration work.
  */
 @Component
 public class ChatClientFactory {
 
+    private static final Logger log = LoggerFactory.getLogger(ChatClientFactory.class);
+
+    private static final int DEFAULT_TIMEOUT_SECONDS = 300;
+
     /**
      * Creates a client for one role.
      *
+     * @param role   which role this client answers for. Needed because the endpoint that
+     *               serves a request is recorded per role
      * @param config the resolved configuration, defaults already merged in
      * @return a client ready to be used by the corresponding consumer
      * @throws IllegalArgumentException if the configuration is incomplete
      */
-    public ChatClient create(RoleConfig config) {
+    public ChatClient create(LlmRole role, RoleConfig config) {
         if (config == null) {
             throw new IllegalArgumentException("No configuration provided");
         }
@@ -42,25 +48,21 @@ public class ChatClientFactory {
         }
 
         return switch (config.provider()) {
-            case ANTHROPIC -> ChatClient.builder(anthropicModel(config)).build();
-            case OPENAI, OPENAI_COMPATIBLE -> ChatClient.builder(openAiModel(config)).build();
+            case ANTHROPIC -> ChatClient.builder(anthropicModel(role, config)).build();
+            case OPENAI, OPENAI_COMPATIBLE -> ChatClient.builder(openAiModel(role, config)).build();
             case null -> throw new IllegalArgumentException("No provider declared for: " + config);
         };
     }
 
-    private OpenAiChatModel openAiModel(RoleConfig config) {
-        // Endpoint and credentials belong to the API object, not to the options: the
-        // options describe the request, the API object describes where it goes.
-        OpenAiApi.Builder api = OpenAiApi.builder();
+    private OpenAiChatModel openAiModel(LlmRole role, RoleConfig config) {
+
+        OpenAiApi.Builder api = OpenAiApi.builder()
+                .restClientBuilder(httpClientFor(role, config));
 
         if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
-            // Note: the client appends the completions path itself, so the base URL must
-            // stop at the host and port. A local engine served at http://host:8000/v1
-            // must therefore be declared as http://host:8000.
             api.baseUrl(config.baseUrl());
         }
-        // A local engine needs no authentication, but the client still requires a
-        // non-null value: hence the placeholder rather than an empty string.
+
         api.apiKey(config.apiKey() != null ? config.apiKey() : "not-required");
 
         OpenAiChatOptions.Builder options = OpenAiChatOptions.builder()
@@ -80,8 +82,9 @@ public class ChatClientFactory {
                 .build();
     }
 
-    private AnthropicChatModel anthropicModel(RoleConfig config) {
-        AnthropicApi.Builder api = AnthropicApi.builder();
+    private AnthropicChatModel anthropicModel(LlmRole role, RoleConfig config) {
+        AnthropicApi.Builder api = AnthropicApi.builder()
+                .restClientBuilder(httpClientFor(role, config));
 
         if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
             api.baseUrl(config.baseUrl());
@@ -104,10 +107,28 @@ public class ChatClientFactory {
                 .build();
     }
 
-    // --- option parsing ----------------------------------------------------- //
-    // Values arrive from YAML, so an integer may surface as Integer, Long or String
-    // depending on how it was written. Coercing here keeps the blueprint forgiving
-    // about formatting without letting a malformed value pass silently.
+    private RestClient.Builder httpClientFor(LlmRole role, RoleConfig config) {
+        int seconds = config.timeoutSeconds() > 0
+                ? config.timeoutSeconds()
+                : DEFAULT_TIMEOUT_SECONDS;
+
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory();
+        factory.setReadTimeout(Duration.ofSeconds(seconds));
+
+        RestClient.Builder builder = RestClient.builder().requestFactory(factory);
+
+        ProviderRouting routing = ProviderRouting.from(role, config);
+        if (routing != null) {
+            builder.requestInterceptor(routing);
+            log.info("Fissaggio attivo — {}", routing);
+        } else if (config.provider() == Provider.OPENAI_COMPATIBLE) {
+            // Warned only for an OpenAI-compatible endpoint
+            log.warn("Nessun fissaggio per {} ({}): l'endpoint puo' essere scelto "
+                            + "liberamente, e due esecuzioni possono non essere confrontabili",
+                    role, config.model());
+        }
+        return builder;
+    }
 
     private java.util.Optional<Double> asDouble(Object value) {
         if (value instanceof Number number) {

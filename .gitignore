@@ -38,6 +38,3 @@ build/
 reports/
 JavaBrew.pdf
 kb/
-
-# Local-only backup of removed glossary feature (not tracked)
-glossary-backup/

@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Evidence Anchoring service: NON-LLM verification that quotes
@@ -48,50 +49,39 @@ public class EvidenceAnchoringService {
         int rejected = 0;
 
         for (AuditIssue issue : issues) {
-            if (!issue.hasConfidence()) {
-                // The model never stated a confidence for this issue. It is passed
-                // through untouched rather than being assigned a computed value: the
-                // downstream filter will discard it anyway, and preserving the absence
-                // is what allows the omission to be counted and reported. Adjusting it
-                // here would turn a missing value into a number and erase the evidence
-                // of a format-compliance failure.
-                anchored.add(issue);
-                continue;
-            }
-
             if (issue.quote() == null || issue.quote().isBlank()) {
                 // No quote: penalize confidence but don't discard
-                anchored.add(issue.withConfidence(issue.confidenceOrZero() * 0.5));
+                anchored.add(issue.withConfidence(issue.confidenceScore() * 0.5));
                 continue;
             }
 
             String normalizedQuote = normalize(issue.quote());
             if (normalizedQuote.length() < 15) {
                 // Quote too short for reliable match: accept with penalty
-                anchored.add(issue.withConfidence(issue.confidenceOrZero() * 0.7));
+                anchored.add(issue.withConfidence(issue.confidenceScore() * 0.7));
                 continue;
             }
 
             double similarity = bestSlidingWindowSimilarity(normalizedDoc, normalizedQuote);
 
             if (similarity < MIN_SIMILARITY) {
-                log.debug("EvidenceAnchoring: SCARTATA [{}] — quote non trovata (similarity={:.2f}): \"{}\"",
-                        issue.id(), similarity, truncate(issue.quote(), 80));
+                log.debug("EvidenceAnchoring: SCARTATA [{}] — quote non trovata (similarity={}): \"{}\"",
+                        issue.id(), fmt(similarity), truncate(issue.quote(), 80));
                 rejected++;
             } else {
                     // Adjust confidence based on match
                 double adjustedConfidence;
                 if (similarity >= BOOST_THRESHOLD) {
                     // Excellent match: boost up to +15%
-                    adjustedConfidence = Math.min(1.0, issue.confidenceOrZero() * (1.0 + (similarity - BOOST_THRESHOLD) * 0.5));
+                    adjustedConfidence = Math.min(1.0, issue.confidenceScore() * (1.0 + (similarity - BOOST_THRESHOLD) * 0.5));
                 } else {
                     // Acceptable but not perfect match: proportional penalty
                     double penalty = 1.0 - ((BOOST_THRESHOLD - similarity) / (BOOST_THRESHOLD - MIN_SIMILARITY)) * 0.3;
-                    adjustedConfidence = issue.confidenceOrZero() * penalty;
+                    adjustedConfidence = issue.confidenceScore() * penalty;
                 }
 
-                log.debug("EvidenceAnchoring: OK [{}] similarity={}, confidence {} -> {}",
-                        issue.id(), similarity, issue.confidenceOrZero(), adjustedConfidence);
+                log.debug("EvidenceAnchoring: OK [{}] similarity={}, confidence {} → {}",
+                        issue.id(), fmt(similarity), fmt(issue.confidenceScore()), fmt(adjustedConfidence));
                 anchored.add(issue.withConfidence(adjustedConfidence));
             }
         }
@@ -258,6 +248,16 @@ public class EvidenceAnchoringService {
                 .replaceAll("[\\p{Punct}]", " ")
                 .replaceAll("\\s+", " ")
                 .strip();
+    }
+
+    /**
+     * The only difference in this class from the original.
+     * Formats a score with two decimals and a dot separator, independent of the
+     * default locale: SLF4J only understands the {} placeholder, so the values
+     * have to arrive already formatted.
+     */
+    private static String fmt(double value) {
+        return String.format(Locale.ROOT, "%.2f", value);
     }
 
     private String truncate(String text, int maxLen) {
